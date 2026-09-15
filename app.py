@@ -305,7 +305,7 @@ if is_generating:
                 try:
                     client = genai.Client(api_key=key)
                     response = client.models.generate_content(
-                        model="gemini-2.5-flash",
+                        model="gemini-3.6-flash",
                         contents=contents_payload,
                         config=types.GenerateContentConfig(
                             system_instruction=system_instruction_text
