@@ -6,6 +6,7 @@ import pytz
 from io import BytesIO
 from PIL import Image
 from datetime import datetime
+from google.genai import types
 from google import genai
 from tavily import TavilyClient
 from streamlit_paste_button import paste_image_button
