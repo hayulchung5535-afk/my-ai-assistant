@@ -3,3 +3,4 @@ google-genai
 tavily-python
 streamlit-paste-button
 pytz
+Pillow
