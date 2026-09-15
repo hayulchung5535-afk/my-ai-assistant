@@ -2,6 +2,7 @@ import streamlit as st
 import json
 import os
 import base64
+import pytz
 from io import BytesIO
 from PIL import Image
 from datetime import datetime
@@ -232,6 +233,8 @@ if user_input := st.chat_input("질문이나 지시사항을 입력하세요..."
     st.session_state.uploader_key += 1
     st.rerun()
 
+
+
 # 9. 답변 생성 로직
 if is_generating:
     last_user_msg = st.session_state.messages[-1]
@@ -239,12 +242,14 @@ if is_generating:
     last_user_image_b64 = last_user_msg.get("image")
 
     with st.chat_message("assistant"):
-        now_str = datetime.now().strftime("%Y년 %m월 %d일 %H시 %M분")
+        # 1. KST 시각을 구한 뒤 무조건 문자열 변수에 담음
+        kst = pytz.timezone('Asia/Seoul')
+        now_str = datetime.now(kst).strftime("%Y년 %m월 %d일 %H시 %M분 (%A)")
 
         search_keywords = [
             "검색", "최신", "찾아", "뉴스", "정보", "알려", "구글",
-            "몇", "개", "얼마", "언제", "누구", "어디", "현재", "오늘",
-            "순위", "기록", "성적", "결과", "일정", "홈런", "경기", "날씨"
+            "몇", "개", "얼마", "언제", "누구", "어디", "현재", "오늘", "어제",
+            "순위", "기록", "성적", "결과", "일정", "홈런", "경기", "날씨", "KBO"
         ]
         need_search = any(kw in last_user_input for kw in search_keywords)
 
@@ -254,8 +259,10 @@ if is_generating:
                 st.warning("⚠️ TAVILY_API_KEY가 설정되지 않아 웹 검색을 건너뜁니다.")
             else:
                 with st.spinner("웹 정보 실시간 검색 중..."):
-                    search_data = search_tavily(last_user_input)
+                    search_query = f"{now_str} 기준 {last_user_input}"
+                    search_data = search_tavily(search_query)
 
+        # 2. 이전 대화 내역 구성
         recent_history = ""
         if len(st.session_state.messages) > 1:
             recent_history = "--- [이전 대화 기록] ---\n"
@@ -265,25 +272,30 @@ if is_generating:
                     recent_history += f"{role_name}: {msg.get('content', '')}\n"
             recent_history += "-----------------------\n\n"
 
-        augmented_prompt = (
-            f"당신은 친절하고 정확한 AI 어시스턴트입니다.\n"
-            f"[현재 실제 시스템 일시]: {now_str}\n\n"
-            f"지침:\n"
-            f"1. 날짜 및 시간 관련 질문은 반드시 [현재 실제 시스템 일시]인 {now_str}를 기준으로 정확하게 답변하세요.\n"
-            f"2. 제공된 Tavily 웹 검색 결과의 최신 정보를 반영하여 답변을 구성하세요.\n"
-            f"3. 이미지 파일이 전달된 경우, 해당 이미지를 자세히 분석하여 질문에 맞춰 답변하세요.\n\n"
+        # 3. [핵심 수정] contents_payload 내부에 KST 시각을 직접 강제로 주입
+        final_user_prompt = (
+            f"📌 [현재 실제 대한민국 KST 시각]: {now_str}\n"
+            f"📌 [시간 기준 지침]: 시간, 날짜, 오늘, 지금 관련 모든 판단은 반드시 위 '현재 실제 대한민국 KST 시각'({now_str})을 기준으로만 답변하세요.\n\n"
             f"{recent_history}"
         )
 
         if search_data:
-            augmented_prompt += f"[웹 검색 결과]\n{search_data}\n\n"
+            final_user_prompt += f"[웹 검색 결과]\n{search_data}\n\n"
 
-        augmented_prompt += f"[사용자 질문]\n{last_user_input}"
+        final_user_prompt += f"[사용자 질문]\n{last_user_input}"
 
-        contents_payload = [augmented_prompt]
+        contents_payload = [final_user_prompt]
         if last_user_image_b64:
             img_to_send = base64_to_image(last_user_image_b64)
             contents_payload.append(img_to_send)
+
+        # 4. system_instruction에도 한번 더 시간 기준 및 환각 방지 강제
+        system_instruction_text = (
+            f"너는 친절하고 정확한 AI 어시스턴트이다.\n"
+            f"현재 시각은 대한민국 표준시(KST)로 [{now_str}] 이다.\n"
+            f"이전 대화 기록의 시각에 얽매이지 말고, 무조건 위에 명시된 현재 시각[{now_str}]을 기준으로 답변해라.\n"
+            f"검색 결과에 없는 사실관계나 스포츠 결과는 절대 지어내지 말 것."
+        )
 
         answer_text = None
         
@@ -292,8 +304,11 @@ if is_generating:
                 try:
                     client = genai.Client(api_key=key)
                     response = client.models.generate_content(
-                        model="gemini-3.6-flash",
-                        contents=contents_payload
+                        model="gemini-2.5-flash",
+                        contents=contents_payload,
+                        config=types.GenerateContentConfig(
+                            system_instruction=system_instruction_text
+                        )
                     )
                     answer_text = response.text
                     break
