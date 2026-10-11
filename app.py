@@ -34,7 +34,7 @@ if not GEMINI_API_KEYS:
 
 TAVILY_API_KEY = st.secrets.get("TAVILY_API_KEY", "")
 
-# 2. 세션 및 파일 저장 관리 함수 (앱이 잠겨도 대화가 안 날아감)
+# 2. 세션 및 파일 저장 관리 함수
 def get_all_sessions():
     files = [f for f in os.listdir(SESSIONS_DIR) if f.endswith(".json")]
     files.sort(key=lambda x: os.path.getmtime(os.path.join(SESSIONS_DIR, x)), reverse=True)
@@ -187,7 +187,6 @@ is_generating = (
 
 current_img = None
 
-# AI가 대화 중(답변 생성 중)이 아닐 때만 업로드 창 출력
 if not is_generating:
     upload_container = st.container()
     with upload_container:
@@ -231,11 +230,10 @@ if user_input := st.chat_input("질문이나 지시사항을 입력하세요..."
     st.session_state.messages.append(user_msg_data)
     save_session(st.session_state.current_session_id, st.session_state.messages)
     
-    # 전송 후 키 변경 (업로드 영역 초기화)
     st.session_state.uploader_key += 1
     st.rerun()
 
-# 9. 답변 생성 로직 (503 / 500 / 429 끈질긴 자동 재시도 적용)
+# 9. 답변 생성 로직 (모든 채팅방 통합 기억 + 503/500/429 끈질긴 자동 재시도)
 if is_generating:
     last_user_msg = st.session_state.messages[-1]
     last_user_input = last_user_msg["content"]
@@ -262,19 +260,30 @@ if is_generating:
                     search_query = f"{now_str} 기준 {last_user_input}"
                     search_data = search_tavily(search_query)
 
-        recent_history = ""
-        if len(st.session_state.messages) > 1:
-            recent_history = "--- [이전 대화 기록] ---\n"
-            for msg in st.session_state.messages[:-1]:
+        # [핵심] 다른 모든 채팅방 기록까지 전역으로 불러와서 AI에게 전달
+        global_history_text = "--- [모든 채팅방 통합 이전 대화 기억] ---\n"
+        all_session_files = get_all_sessions()
+        sorted_files = sorted(all_session_files, key=lambda x: os.path.getmtime(os.path.join(SESSIONS_DIR, x)))
+        
+        all_collected_msgs = []
+        for s_file in sorted_files:
+            s_id = s_file.replace(".json", "")
+            msgs = load_session(s_id)
+            for msg in msgs:
                 if isinstance(msg, dict):
-                    role_name = "사용자" if msg.get("role") == "user" else "AI"
-                    recent_history += f"{role_name}: {msg.get('content', '')}\n"
-            recent_history += "-----------------------\n\n"
+                    all_collected_msgs.append(msg)
+        
+        # 최근 40개 메시지만 골라서 전역 맥락 유지 (토큰 초과 방지)
+        for msg in all_collected_msgs[-40:]:
+            role_name = "사용자" if msg.get("role") == "user" else "AI"
+            content_snippet = msg.get('content', '').replace('\n', ' ')
+            global_history_text += f"{role_name}: {content_snippet}\n"
+        global_history_text += "---------------------------------------\n\n"
 
         final_user_prompt = (
             f"📌 [현재 대한민국 KST 시각]: {now_str}\n"
             f"📌 [시간 기준 지침]: 시간, 날짜, 오늘, 지금 관련 모든 판단은 반드시 위 시각({now_str})을 기준으로만 답변하세요.\n\n"
-            f"{recent_history}"
+            f"{global_history_text}"
         )
 
         if search_data:
@@ -290,12 +299,12 @@ if is_generating:
         system_instruction_text = (
             f"너는 친절하고 정확한 AI 어시스턴트이다.\n"
             f"현재 시각은 대한민국 표준시(KST)로 [{now_str}] 이다.\n"
-            f"이전 대화 기록의 시각에 얽매이지 말고, 무조건 위에 명시된 현재 시각[{now_str}]을 기준으로 답변해라.\n"
+            f"이전 대화 기록(다른 채팅방 포함)에 담긴 사용자의 선호나 정보, 질문 내용을 온전히 기억하고 답변해라.\n"
             f"검색 결과에 없는 사실관계나 스포츠 결과는 절대 지어내지 말 것."
         )
 
         answer_text = None
-        max_retries_per_key = 5  # 각 키 당 최대 5번 재시도 (503/500/429 대응)
+        max_retries_per_key = 5  # 503/500/429 대응 재시도
         
         with st.spinner("답변을 생성하는 중 (서버 응답 대기 중)..."):
             for idx, key in enumerate(GEMINI_API_KEYS):
@@ -314,22 +323,18 @@ if is_generating:
                             )
                         )
                         answer_text = response.text
-                        break  # 성공 시 루프 탈출
+                        break
 
                     except Exception as e:
                         error_msg = str(e)
-                        
-                        # 503, 500, 429 에러 발생 시 점진적으로 대기 시간을 늘려가며 끈질기게 재시도
                         if any(err in error_msg for err in ["503", "UNAVAILABLE", "500", "INTERNAL", "429", "RESOURCE_EXHAUSTED"]):
                             if attempt < max_retries_per_key - 1:
-                                sleep_time = 2 + (attempt * 1.5)  # 2초 -> 3.5초 -> 5초...
+                                sleep_time = 2 + (attempt * 1.5)
                                 time.sleep(sleep_time)
                                 continue
                             else:
-                                # 현재 키의 재시도 횟수를 다 쓰면 다음 API 키로 넘어감
                                 break
                         else:
-                            # 다른 치명적 에러인 경우 즉시 중단
                             break
 
         if not answer_text:
