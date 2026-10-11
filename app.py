@@ -233,7 +233,7 @@ if user_input := st.chat_input("질문이나 지시사항을 입력하세요..."
     st.session_state.uploader_key += 1
     st.rerun()
 
-# 9. 답변 생성 로직 (모든 채팅방 통합 기억 + 503/500/429 끈질긴 자동 재시도)
+# 9. 답변 생성 로직 (전역 통합 기억 최대 확장 + 503/500/429 끈질긴 자동 재시도)
 if is_generating:
     last_user_msg = st.session_state.messages[-1]
     last_user_input = last_user_msg["content"]
@@ -260,8 +260,8 @@ if is_generating:
                     search_query = f"{now_str} 기준 {last_user_input}"
                     search_data = search_tavily(search_query)
 
-        # [핵심] 다른 모든 채팅방 기록까지 전역으로 불러와서 AI에게 전달
-        global_history_text = "--- [모든 채팅방 통합 이전 대화 기억] ---\n"
+        # [개선 1] 모든 채팅방 통합 이전 대화 기억을 최대 200개까지 대폭 확대하여 수집
+        global_history_text = "--- [모든 채팅방 통합 이전 대화 기억 (대규모 누적)] ---\n"
         all_session_files = get_all_sessions()
         sorted_files = sorted(all_session_files, key=lambda x: os.path.getmtime(os.path.join(SESSIONS_DIR, x)))
         
@@ -273,12 +273,12 @@ if is_generating:
                 if isinstance(msg, dict):
                     all_collected_msgs.append(msg)
         
-        # 최근 40개 메시지만 골라서 전역 맥락 유지 (토큰 초과 방지)
-        for msg in all_collected_msgs[-40:]:
+        # 최대 200개의 이전 메시지를 포함하여 기억 손실 최소화
+        for msg in all_collected_msgs[-200:]:
             role_name = "사용자" if msg.get("role") == "user" else "AI"
             content_snippet = msg.get('content', '').replace('\n', ' ')
             global_history_text += f"{role_name}: {content_snippet}\n"
-        global_history_text += "---------------------------------------\n\n"
+        global_history_text += "---------------------------------------------------\n\n"
 
         final_user_prompt = (
             f"📌 [현재 대한민국 KST 시각]: {now_str}\n"
@@ -296,11 +296,14 @@ if is_generating:
             img_to_send = base64_to_image(last_user_image_b64)
             contents_payload.append(img_to_send)
 
+        # [개선 2] 시스템 지침에 핵심 기억 유지 및 절대 규칙 명시
         system_instruction_text = (
             f"너는 친절하고 정확한 AI 어시스턴트이다.\n"
             f"현재 시각은 대한민국 표준시(KST)로 [{now_str}] 이다.\n"
-            f"이전 대화 기록(다른 채팅방 포함)에 담긴 사용자의 선호나 정보, 질문 내용을 온전히 기억하고 답변해라.\n"
-            f"검색 결과에 없는 사실관계나 스포츠 결과는 절대 지어내지 말 것."
+            f"⚠️ [절대 규칙: 전역 대화 기억 및 중요 정보 유지]\n"
+            f"- 아래 제공되는 '모든 채팅방 통합 이전 대화 기억'에 있는 모든 내용(사용자가 언급한 관심사, 질문, 이전 대화 주제 등)을 절대 잊지 말고 완벽히 기억하고 연계하여 답변하세요.\n"
+            f"- 새로운 채팅방으로 이동했더라도 이전에 나눈 이야기(예: 로또, 코딩, 기타 취향 등)를 자연스럽게 기억하고 참조해야 합니다.\n"
+            f"- 검색 결과에 없는 사실관계나 스포츠 결과는 절대 지어내지 말 것."
         )
 
         answer_text = None
