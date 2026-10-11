@@ -4,6 +4,9 @@ import os
 import base64
 import time
 import pytz
+import re
+import requests
+from bs4 import BeautifulSoup
 from io import BytesIO
 from PIL import Image
 from datetime import datetime
@@ -107,7 +110,23 @@ def search_tavily(query):
     except Exception as e:
         return f"[Tavily 검색 오류: {e}]"
 
-# 4. 세션 상태 초기화
+# 4. [신규] 웹페이지 링크 크롤링 함수
+def fetch_webpage_content(url):
+    """사용자가 보낸 URL에 접속하여 본문 텍스트를 추출합니다."""
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        response = requests.get(url, headers=headers, timeout=6)
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, 'html.parser')
+            for script in soup(["script", "style", "nav", "footer", "header"]):
+                script.decompose()
+            text = soup.get_text(separator=' ', strip=True)
+            return text[:6000]  # 토큰 초과 방지를 위해 최대 6000자 제한
+    except Exception as e:
+        return f"[웹페이지 내용 로드 실패: {e}]"
+    return ""
+
+# 5. 세션 상태 초기화
 if "current_session_id" not in st.session_state:
     all_sessions = get_all_sessions()
     if all_sessions:
@@ -121,7 +140,7 @@ if "messages" not in st.session_state:
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
 
-# 5. 사이드바 UI (대화 세션 목록 관리)
+# 6. 사이드바 UI (대화 세션 목록 관리)
 with st.sidebar:
     if st.button("➕ 새 대화 시작", use_container_width=True, type="primary"):
         new_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -165,7 +184,7 @@ with st.sidebar:
         st.session_state.uploader_key += 1
         st.rerun()
 
-# 6. 메인 화면 메시지 출력
+# 7. 메인 화면 메시지 출력
 st.title(APP_TITLE)
 
 for msg in st.session_state.messages:
@@ -179,7 +198,7 @@ for msg in st.session_state.messages:
                     pass
             st.markdown(msg["content"])
 
-# 7. 답변 생성 필요 여부 확인
+# 8. 답변 생성 필요 여부 확인
 is_generating = (
     bool(st.session_state.messages) and 
     st.session_state.messages[-1]["role"] == "user"
@@ -216,8 +235,8 @@ if not is_generating:
             current_img = resize_image(current_img)
             st.image(current_img, caption="전송할 이미지 (자동 리사이즈 적용됨)", width=250)
 
-# 8. 사용자 입력 처리
-if user_input := st.chat_input("질문이나 지시사항을 입력하세요..."):
+# 9. 사용자 입력 처리
+if user_input := st.chat_input("질문이나 지시사항, 혹은 분석할 링크를 입력하세요..."):
     if not GEMINI_API_KEYS:
         st.error("GEMINI_API_KEYS 설정이 필요합니다. .streamlit/secrets.toml 파일을 확인해 주세요.")
         st.stop()
@@ -233,7 +252,7 @@ if user_input := st.chat_input("질문이나 지시사항을 입력하세요..."
     st.session_state.uploader_key += 1
     st.rerun()
 
-# 9. 답변 생성 로직 (전역 통합 기억 최대 확장 + 503/500/429 끈질긴 자동 재시도)
+# 10. 답변 생성 로직 (웹 링크 크롤링 + 전역 기억 200개 + 자동 재시도)
 if is_generating:
     last_user_msg = st.session_state.messages[-1]
     last_user_input = last_user_msg["content"]
@@ -243,6 +262,16 @@ if is_generating:
         kst = pytz.timezone('Asia/Seoul')
         now_str = datetime.now(kst).strftime("%Y년 %m월 %d일 %H시 %M분 (%A)")
 
+        # 1. 링크(URL) 감지 및 크롤링 처리
+        url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
+        found_urls = re.findall(url_pattern, last_user_input)
+
+        webpage_data = ""
+        if found_urls:
+            with st.spinner(f"🔗 링크된 웹페이지 내용 분석 중... ({found_urls[0]})"):
+                webpage_data = fetch_webpage_content(found_urls[0])
+
+        # 2. 실시간 검색 키워드 감지
         search_keywords = [
             "검색", "최신", "찾아", "뉴스", "정보", "알려", "구글",
             "몇", "개", "얼마", "언제", "누구", "어디", "현재", "오늘", "어제",
@@ -260,7 +289,7 @@ if is_generating:
                     search_query = f"{now_str} 기준 {last_user_input}"
                     search_data = search_tavily(search_query)
 
-        # [개선 1] 모든 채팅방 통합 이전 대화 기억을 최대 200개까지 대폭 확대하여 수집
+        # 3. 전역 통합 이전 대화 기억 (최대 200개)
         global_history_text = "--- [모든 채팅방 통합 이전 대화 기억 (대규모 누적)] ---\n"
         all_session_files = get_all_sessions()
         sorted_files = sorted(all_session_files, key=lambda x: os.path.getmtime(os.path.join(SESSIONS_DIR, x)))
@@ -273,7 +302,6 @@ if is_generating:
                 if isinstance(msg, dict):
                     all_collected_msgs.append(msg)
         
-        # 최대 200개의 이전 메시지를 포함하여 기억 손실 최소화
         for msg in all_collected_msgs[-200:]:
             role_name = "사용자" if msg.get("role") == "user" else "AI"
             content_snippet = msg.get('content', '').replace('\n', ' ')
@@ -286,8 +314,11 @@ if is_generating:
             f"{global_history_text}"
         )
 
+        if webpage_data:
+            final_user_prompt += f"🌐 [사용자가 제공한 링크 웹페이지 내용]\n{webpage_data}\n\n"
+
         if search_data:
-            final_user_prompt += f"[웹 검색 결과]\n{search_data}\n\n"
+            final_user_prompt += f"🔍 [웹 검색 결과]\n{search_data}\n\n"
 
         final_user_prompt += f"[사용자 질문]\n{last_user_input}"
 
@@ -296,14 +327,13 @@ if is_generating:
             img_to_send = base64_to_image(last_user_image_b64)
             contents_payload.append(img_to_send)
 
-        # [개선 2] 시스템 지침에 핵심 기억 유지 및 절대 규칙 명시
         system_instruction_text = (
             f"너는 친절하고 정확한 AI 어시스턴트이다.\n"
             f"현재 시각은 대한민국 표준시(KST)로 [{now_str}] 이다.\n"
-            f"⚠️ [절대 규칙: 전역 대화 기억 및 중요 정보 유지]\n"
-            f"- 아래 제공되는 '모든 채팅방 통합 이전 대화 기억'에 있는 모든 내용(사용자가 언급한 관심사, 질문, 이전 대화 주제 등)을 절대 잊지 말고 완벽히 기억하고 연계하여 답변하세요.\n"
-            f"- 새로운 채팅방으로 이동했더라도 이전에 나눈 이야기(예: 로또, 코딩, 기타 취향 등)를 자연스럽게 기억하고 참조해야 합니다.\n"
-            f"- 검색 결과에 없는 사실관계나 스포츠 결과는 절대 지어내지 말 것."
+            f"⚠️ [절대 규칙: 전역 대화 기억 및 링크/검색 활용]\n"
+            f"- 이전 대화 기억에 있는 모든 내용(사용자의 관심사, 이전 질문 등)을 완벽히 기억하고 연계하여 답변하세요.\n"
+            f"- 사용자가 웹사이트 링크를 제공한 경우, '사용자가 제공한 링크 웹페이지 내용'을 철저히 분석하여 요약하거나 질문에 답변하세요.\n"
+            f"- 검색 결과나 링크 내용에 없는 사실관계는 절대 지어내지 말 것."
         )
 
         answer_text = None
@@ -341,7 +371,7 @@ if is_generating:
                             break
 
         if not answer_text:
-            answer_text = "⚠️ 현재 Google Gemini 서버 과부하 및 내부 오류(503/500)가 지속되고 있습니다. 잠시 후 다시 질문해 주세요!"
+            answer_text = "⚠️ 현재 Google Gemini 서버 과부하 및 내부 오류(503/500)가 지속되었습니다. 잠시 후 다시 질문해 주세요!"
 
         st.session_state.messages.append({"role": "assistant", "content": answer_text, "image": None})
         save_session(st.session_state.current_session_id, st.session_state.messages)
