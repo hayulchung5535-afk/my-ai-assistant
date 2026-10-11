@@ -113,14 +113,15 @@ def search_tavily(query):
 # 4. 웹페이지 링크 크롤링 함수 (보안 차단 시 빈값 반환)
 def fetch_webpage_content(url):
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        response = requests.get(url, headers=headers, timeout=5)
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+        response = requests.get(url, headers=headers, timeout=6)
         if response.status_code == 200:
             soup = BeautifulSoup(response.text, 'html.parser')
-            for script in soup(["script", "style", "nav", "footer", "header"]):
+            for script in soup(["script", "style", "nav", "footer", "header", "aside"]):
                 script.decompose()
             text = soup.get_text(separator=' ', strip=True)
-            return text[:6000]
+            if len(text) > 100:  # 내용이 정상적으로 긁혀온 경우에만 반환
+                return text[:6000]
     except Exception:
         pass
     return ""
@@ -251,7 +252,7 @@ if user_input := st.chat_input("질문이나 지시사항, 혹은 분석할 링�
     st.session_state.uploader_key += 1
     st.rerun()
 
-# 10. 답변 생성 로직 (스마트 링크 Fallback + 전역 기억 200개 + 자동 재시도)
+# 10. 답변 생성 로직 (정밀 링크 Fallback + 전역 기억 200개 + 자동 재시도)
 if is_generating:
     last_user_msg = st.session_state.messages[-1]
     last_user_input = last_user_msg["content"]
@@ -261,7 +262,7 @@ if is_generating:
         kst = pytz.timezone('Asia/Seoul')
         now_str = datetime.now(kst).strftime("%Y년 %m월 %d일 %H시 %M분 (%A)")
 
-        # 1. 링크(URL) 감지 및 크롤링 시도 (실패 시 Tavily 웹 검색으로 자동 전환)
+        # 1. 링크(URL) 감지 및 정밀 크롤링/검색 Fallback 처리
         url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
         found_urls = re.findall(url_pattern, last_user_input)
 
@@ -269,11 +270,22 @@ if is_generating:
         search_data = ""
 
         if found_urls:
-            with st.spinner(f"🔗 링크된 웹페이지 분석 중... ({found_urls[0]})"):
-                webpage_data = fetch_webpage_content(found_urls[0])
-                # 직접 스크래핑이 막히거나 실패하면 Tavily 검색 엔진으로 즉시 대체하여 정보 수집
+            target_url = found_urls[0]
+            with st.spinner(f"🔗 링크된 웹페이지 분석 중... ({target_url})"):
+                webpage_data = fetch_webpage_content(target_url)
+                
+                # 직접 읽기 실패(보안 차단 등) 시 Tavily 검색으로 정밀 우회 검색
                 if not webpage_data:
-                    search_data = search_tavily(found_urls[0])
+                    try:
+                        domain = target_url.split('/')[2]
+                        path_part = target_url.split('/')[-1]
+                        # 도메인과 고유 ID/경로를 조합해 검색 정확도 극대화
+                        refined_query = f"site:{domain} {path_part}"
+                        search_data = search_tavily(refined_query)
+                        if not search_data or "검색 결과가 없습니다" in search_data:
+                            search_data = search_tavily(target_url)
+                    except Exception:
+                        search_data = search_tavily(target_url)
 
         # 2. 일반 검색 키워드 감지
         search_keywords = [
@@ -330,13 +342,14 @@ if is_generating:
             img_to_send = base64_to_image(last_user_image_b64)
             contents_payload.append(img_to_send)
 
+        # [핵심] AI가 변명하지 못하도록 엄격한 지침 부여
         system_instruction_text = (
             f"너는 친절하고 정확한 AI 어시스턴트이다.\n"
             f"현재 시각은 대한민국 표준시(KST)로 [{now_str}] 이다.\n"
-            f"⚠️ [절대 규칙: 인터넷 검색 및 링크 활용]\n"
+            f"⚠️ [절대 규칙: 검색 및 링크 분석]\n"
             f"- 이전 대화 기억에 있는 내용과 사용자의 질문을 완벽히 연계하여 답변하세요.\n"
-            f"- 사용자가 링크를 제공했거나 최신 정보가 필요한 경우, 제공된 [웹페이지 직접 추출 본문] 또는 [인터넷 실시간 검색 결과]의 내용을 철저히 분석하여 정확하게 답변하세요.\n"
-            f"- 검색 결과나 본문에 없는 내용은 절대 지어내지 말 것."
+            f"- 사용자가 링크를 제공한 경우, [웹페이지 직접 추출 본문] 또는 [인터넷 실시간 검색 결과]에 담긴 정보를 바탕으로 내용을 상세히 분석하고 요약하여 답변하세요.\n"
+            f"- 절대 '기술적 한계로 접속할 수 없다'거나 '불가능하다'고 변명하지 마세요. 주어진 검색 결과와 본문을 최대한 활용하여 성실히 답변할 것."
         )
 
         answer_text = None
