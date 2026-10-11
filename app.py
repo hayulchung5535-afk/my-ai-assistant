@@ -110,20 +110,19 @@ def search_tavily(query):
     except Exception as e:
         return f"[Tavily 검색 오류: {e}]"
 
-# 4. [신규] 웹페이지 링크 크롤링 함수
+# 4. 웹페이지 링크 크롤링 함수 (보안 차단 시 빈값 반환)
 def fetch_webpage_content(url):
-    """사용자가 보낸 URL에 접속하여 본문 텍스트를 추출합니다."""
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        response = requests.get(url, headers=headers, timeout=6)
+        response = requests.get(url, headers=headers, timeout=5)
         if response.status_code == 200:
             soup = BeautifulSoup(response.text, 'html.parser')
             for script in soup(["script", "style", "nav", "footer", "header"]):
                 script.decompose()
             text = soup.get_text(separator=' ', strip=True)
-            return text[:6000]  # 토큰 초과 방지를 위해 최대 6000자 제한
-    except Exception as e:
-        return f"[웹페이지 내용 로드 실패: {e}]"
+            return text[:6000]
+    except Exception:
+        pass
     return ""
 
 # 5. 세션 상태 초기화
@@ -252,7 +251,7 @@ if user_input := st.chat_input("질문이나 지시사항, 혹은 분석할 링�
     st.session_state.uploader_key += 1
     st.rerun()
 
-# 10. 답변 생성 로직 (웹 링크 크롤링 + 전역 기억 200개 + 자동 재시도)
+# 10. 답변 생성 로직 (스마트 링크 Fallback + 전역 기억 200개 + 자동 재시도)
 if is_generating:
     last_user_msg = st.session_state.messages[-1]
     last_user_input = last_user_msg["content"]
@@ -262,35 +261,39 @@ if is_generating:
         kst = pytz.timezone('Asia/Seoul')
         now_str = datetime.now(kst).strftime("%Y년 %m월 %d일 %H시 %M분 (%A)")
 
-        # 1. 링크(URL) 감지 및 크롤링 처리
+        # 1. 링크(URL) 감지 및 크롤링 시도 (실패 시 Tavily 웹 검색으로 자동 전환)
         url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
         found_urls = re.findall(url_pattern, last_user_input)
 
         webpage_data = ""
-        if found_urls:
-            with st.spinner(f"🔗 링크된 웹페이지 내용 분석 중... ({found_urls[0]})"):
-                webpage_data = fetch_webpage_content(found_urls[0])
+        search_data = ""
 
-        # 2. 실시간 검색 키워드 감지
+        if found_urls:
+            with st.spinner(f"🔗 링크된 웹페이지 분석 중... ({found_urls[0]})"):
+                webpage_data = fetch_webpage_content(found_urls[0])
+                # 직접 스크래핑이 막히거나 실패하면 Tavily 검색 엔진으로 즉시 대체하여 정보 수집
+                if not webpage_data:
+                    search_data = search_tavily(found_urls[0])
+
+        # 2. 일반 검색 키워드 감지
         search_keywords = [
             "검색", "최신", "찾아", "뉴스", "정보", "알려", "구글",
             "몇", "개", "얼마", "언제", "누구", "어디", "현재", "오늘", "어제",
             "순위", "기록", "성적", "결과", "일정", "홈런", "경기", "날씨", "KBO",
             "야구", "선발", "라인업", "승패", "타율", "평자", "구단", "프로야구"
         ]
-        need_search = any(kw in last_user_input for kw in search_keywords)
+        need_search = any(kw in last_user_input for kw in search_keywords) or bool(found_urls)
 
-        search_data = ""
-        if need_search:
+        if need_search and not search_data:
             if not TAVILY_API_KEY:
                 st.warning("⚠️ TAVILY_API_KEY가 설정되지 않아 웹 검색을 건너뜁니다.")
             else:
-                with st.spinner("웹 정보 실시간 검색 중..."):
+                with st.spinner("인터넷 실시간 검색 중..."):
                     search_query = f"{now_str} 기준 {last_user_input}"
                     search_data = search_tavily(search_query)
 
         # 3. 전역 통합 이전 대화 기억 (최대 200개)
-        global_history_text = "--- [모든 채팅방 통합 이전 대화 기억 (대규모 누적)] ---\n"
+        global_history_text = "--- [모든 채팅방 통합 이전 대화 기억] ---\n"
         all_session_files = get_all_sessions()
         sorted_files = sorted(all_session_files, key=lambda x: os.path.getmtime(os.path.join(SESSIONS_DIR, x)))
         
@@ -306,7 +309,7 @@ if is_generating:
             role_name = "사용자" if msg.get("role") == "user" else "AI"
             content_snippet = msg.get('content', '').replace('\n', ' ')
             global_history_text += f"{role_name}: {content_snippet}\n"
-        global_history_text += "---------------------------------------------------\n\n"
+        global_history_text += "---------------------------------------\n\n"
 
         final_user_prompt = (
             f"📌 [현재 대한민국 KST 시각]: {now_str}\n"
@@ -315,10 +318,10 @@ if is_generating:
         )
 
         if webpage_data:
-            final_user_prompt += f"🌐 [사용자가 제공한 링크 웹페이지 내용]\n{webpage_data}\n\n"
+            final_user_prompt += f"🌐 [웹페이지 직접 추출 본문]\n{webpage_data}\n\n"
 
         if search_data:
-            final_user_prompt += f"🔍 [웹 검색 결과]\n{search_data}\n\n"
+            final_user_prompt += f"🔍 [인터넷 실시간 검색 결과]\n{search_data}\n\n"
 
         final_user_prompt += f"[사용자 질문]\n{last_user_input}"
 
@@ -330,10 +333,10 @@ if is_generating:
         system_instruction_text = (
             f"너는 친절하고 정확한 AI 어시스턴트이다.\n"
             f"현재 시각은 대한민국 표준시(KST)로 [{now_str}] 이다.\n"
-            f"⚠️ [절대 규칙: 전역 대화 기억 및 링크/검색 활용]\n"
-            f"- 이전 대화 기억에 있는 모든 내용(사용자의 관심사, 이전 질문 등)을 완벽히 기억하고 연계하여 답변하세요.\n"
-            f"- 사용자가 웹사이트 링크를 제공한 경우, '사용자가 제공한 링크 웹페이지 내용'을 철저히 분석하여 요약하거나 질문에 답변하세요.\n"
-            f"- 검색 결과나 링크 내용에 없는 사실관계는 절대 지어내지 말 것."
+            f"⚠️ [절대 규칙: 인터넷 검색 및 링크 활용]\n"
+            f"- 이전 대화 기억에 있는 내용과 사용자의 질문을 완벽히 연계하여 답변하세요.\n"
+            f"- 사용자가 링크를 제공했거나 최신 정보가 필요한 경우, 제공된 [웹페이지 직접 추출 본문] 또는 [인터넷 실시간 검색 결과]의 내용을 철저히 분석하여 정확하게 답변하세요.\n"
+            f"- 검색 결과나 본문에 없는 내용은 절대 지어내지 말 것."
         )
 
         answer_text = None
