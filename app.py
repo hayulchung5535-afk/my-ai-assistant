@@ -2,6 +2,7 @@ import streamlit as st
 import json
 import os
 import base64
+import time
 import pytz
 from io import BytesIO
 from PIL import Image
@@ -33,7 +34,7 @@ if not GEMINI_API_KEYS:
 
 TAVILY_API_KEY = st.secrets.get("TAVILY_API_KEY", "")
 
-# 2. 세션 및 파일 저장 관리 함수
+# 2. 세션 및 파일 저장 관리 함수 (앱이 잠겨도 대화가 안 날아감)
 def get_all_sessions():
     files = [f for f in os.listdir(SESSIONS_DIR) if f.endswith(".json")]
     files.sort(key=lambda x: os.path.getmtime(os.path.join(SESSIONS_DIR, x)), reverse=True)
@@ -234,23 +235,21 @@ if user_input := st.chat_input("질문이나 지시사항을 입력하세요..."
     st.session_state.uploader_key += 1
     st.rerun()
 
-
-
-# 9. 답변 생성 로직
+# 9. 답변 생성 로직 (503 / 500 / 429 끈질긴 자동 재시도 적용)
 if is_generating:
     last_user_msg = st.session_state.messages[-1]
     last_user_input = last_user_msg["content"]
     last_user_image_b64 = last_user_msg.get("image")
 
     with st.chat_message("assistant"):
-        # 1. KST 시각을 구한 뒤 무조건 문자열 변수에 담음
         kst = pytz.timezone('Asia/Seoul')
         now_str = datetime.now(kst).strftime("%Y년 %m월 %d일 %H시 %M분 (%A)")
 
         search_keywords = [
             "검색", "최신", "찾아", "뉴스", "정보", "알려", "구글",
             "몇", "개", "얼마", "언제", "누구", "어디", "현재", "오늘", "어제",
-            "순위", "기록", "성적", "결과", "일정", "홈런", "경기", "날씨", "KBO"
+            "순위", "기록", "성적", "결과", "일정", "홈런", "경기", "날씨", "KBO",
+            "야구", "선발", "라인업", "승패", "타율", "평자", "구단", "프로야구"
         ]
         need_search = any(kw in last_user_input for kw in search_keywords)
 
@@ -263,7 +262,6 @@ if is_generating:
                     search_query = f"{now_str} 기준 {last_user_input}"
                     search_data = search_tavily(search_query)
 
-        # 2. 이전 대화 내역 구성
         recent_history = ""
         if len(st.session_state.messages) > 1:
             recent_history = "--- [이전 대화 기록] ---\n"
@@ -273,10 +271,9 @@ if is_generating:
                     recent_history += f"{role_name}: {msg.get('content', '')}\n"
             recent_history += "-----------------------\n\n"
 
-        # 3. [핵심 수정] contents_payload 내부에 KST 시각을 직접 강제로 주입
         final_user_prompt = (
-            f"📌 [현재 실제 대한민국 KST 시각]: {now_str}\n"
-            f"📌 [시간 기준 지침]: 시간, 날짜, 오늘, 지금 관련 모든 판단은 반드시 위 '현재 실제 대한민국 KST 시각'({now_str})을 기준으로만 답변하세요.\n\n"
+            f"📌 [현재 대한민국 KST 시각]: {now_str}\n"
+            f"📌 [시간 기준 지침]: 시간, 날짜, 오늘, 지금 관련 모든 판단은 반드시 위 시각({now_str})을 기준으로만 답변하세요.\n\n"
             f"{recent_history}"
         )
 
@@ -290,7 +287,6 @@ if is_generating:
             img_to_send = base64_to_image(last_user_image_b64)
             contents_payload.append(img_to_send)
 
-        # 4. system_instruction에도 한번 더 시간 기준 및 환각 방지 강제
         system_instruction_text = (
             f"너는 친절하고 정확한 AI 어시스턴트이다.\n"
             f"현재 시각은 대한민국 표준시(KST)로 [{now_str}] 이다.\n"
@@ -299,33 +295,46 @@ if is_generating:
         )
 
         answer_text = None
+        max_retries_per_key = 5  # 각 키 당 최대 5번 재시도 (503/500/429 대응)
         
-        with st.spinner("분석 및 답변을 생성하는 중..."):
+        with st.spinner("답변을 생성하는 중 (서버 응답 대기 중)..."):
             for idx, key in enumerate(GEMINI_API_KEYS):
-                try:
-                    client = genai.Client(api_key=key)
-                    response = client.models.generate_content(
-                        model="gemini-3.6-flash",
-                        contents=contents_payload,
-                        config=types.GenerateContentConfig(
-                            system_instruction=system_instruction_text
-                        )
-                    )
-                    answer_text = response.text
+                if answer_text:
                     break
+                
+                client = genai.Client(api_key=key)
 
-                except Exception as e:
-                    error_msg = str(e)
-                    if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
-                        if idx < len(GEMINI_API_KEYS) - 1:
-                            continue
+                for attempt in range(max_retries_per_key):
+                    try:
+                        response = client.models.generate_content(
+                            model="gemini-3.6-flash",
+                            contents=contents_payload,
+                            config=types.GenerateContentConfig(
+                                system_instruction=system_instruction_text
+                            )
+                        )
+                        answer_text = response.text
+                        break  # 성공 시 루프 탈출
+
+                    except Exception as e:
+                        error_msg = str(e)
+                        
+                        # 503, 500, 429 에러 발생 시 점진적으로 대기 시간을 늘려가며 끈질기게 재시도
+                        if any(err in error_msg for err in ["503", "UNAVAILABLE", "500", "INTERNAL", "429", "RESOURCE_EXHAUSTED"]):
+                            if attempt < max_retries_per_key - 1:
+                                sleep_time = 2 + (attempt * 1.5)  # 2초 -> 3.5초 -> 5초...
+                                time.sleep(sleep_time)
+                                continue
+                            else:
+                                # 현재 키의 재시도 횟수를 다 쓰면 다음 API 키로 넘어감
+                                break
                         else:
-                            st.error("⚠️ 등록된 모든 Gemini API 키의 한도가 초과되었습니다.")
-                    else:
-                        st.error(f"Gemini API 호출 중 오류가 발생했습니다: {e}")
-                        break
+                            # 다른 치명적 에러인 경우 즉시 중단
+                            break
 
-        if answer_text:
-            st.session_state.messages.append({"role": "assistant", "content": answer_text, "image": None})
-            save_session(st.session_state.current_session_id, st.session_state.messages)
-            st.rerun()
+        if not answer_text:
+            answer_text = "⚠️ 현재 Google Gemini 서버 과부하 및 내부 오류(503/500)가 지속되고 있습니다. 잠시 후 다시 질문해 주세요!"
+
+        st.session_state.messages.append({"role": "assistant", "content": answer_text, "image": None})
+        save_session(st.session_state.current_session_id, st.session_state.messages)
+        st.rerun()
