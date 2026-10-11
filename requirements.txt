@@ -3,4 +3,6 @@ google-genai
 tavily-python
 streamlit-paste-button
 pytz
-Pillow
+pillow
+requests
+beautifulsoup4
