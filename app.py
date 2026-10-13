@@ -28,7 +28,7 @@ st.set_page_config(page_title=PAGE_TITLE, page_icon=PAGE_ICON, layout="wide")
 SESSIONS_DIR = "chat_sessions"
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 
-# 1. secrets.toml에서 API 키 로드
+# 1. secrets.toml에서 API 키 및 깃허브 설정 로드
 GEMINI_API_KEYS = st.secrets.get("GEMINI_API_KEYS", [])
 if not GEMINI_API_KEYS:
     single_key = st.secrets.get("GEMINI_API_KEY", "")
@@ -36,14 +36,50 @@ if not GEMINI_API_KEYS:
         GEMINI_API_KEYS = [single_key]
 
 TAVILY_API_KEY = st.secrets.get("TAVILY_API_KEY", "")
+GITHUB_TOKEN = st.secrets.get("GITHUB_TOKEN", "")
+GITHUB_REPO = st.secrets.get("GITHUB_REPO", "") # 예: "username/repo_name"
 
-# 2. 세션 및 파일 저장 관리 함수
+# =========================================================
+# ☁️ [GitHub API 연동형 영구 저장소 함수]
+# =========================================================
 def get_all_sessions():
-    files = [f for f in os.listdir(SESSIONS_DIR) if f.endswith(".json")]
-    files.sort(key=lambda x: os.path.getmtime(os.path.join(SESSIONS_DIR, x)), reverse=True)
-    return files
+    """GitHub 또는 로컬에서 세션 파일 목록을 가져옵니다."""
+    if GITHUB_TOKEN and GITHUB_REPO:
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/chat_sessions"
+        headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
+        try:
+            res = requests.get(url, headers=headers, timeout=5)
+            if res.status_code == 200:
+                files = [f["name"] for f in res.json() if f["name"].endswith(".json")]
+                files.sort(reverse=True)
+                return files
+        except Exception:
+            pass
+            
+    # Fallback (로컬)
+    if os.path.exists(SESSIONS_DIR):
+        files = [f for f in os.listdir(SESSIONS_DIR) if f.endswith(".json")]
+        files.sort(key=lambda x: os.path.getmtime(os.path.join(SESSIONS_DIR, x)), reverse=True)
+        return files
+    return []
 
 def load_session(session_id):
+    """GitHub 또는 로컬에서 특정 세션 데이터를 불러옵니다."""
+    if GITHUB_TOKEN and GITHUB_REPO:
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/chat_sessions/{session_id}.json"
+        headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
+        try:
+            res = requests.get(url, headers=headers, timeout=5)
+            if res.status_code == 200:
+                file_data = res.json()
+                content_bytes = base64.b64decode(file_data.get("content", ""))
+                data = json.loads(content_bytes.decode("utf-8"))
+                if isinstance(data, list):
+                    return data
+        except Exception:
+            pass
+
+    # Fallback (로컬)
     file_path = os.path.join(SESSIONS_DIR, f"{session_id}.json")
     if os.path.exists(file_path):
         try:
@@ -56,9 +92,51 @@ def load_session(session_id):
     return []
 
 def save_session(session_id, messages):
+    """로컬에 저장하고 동시에 GitHub 레포지토리에 실시간 자동 백업합니다."""
+    # 1. 로컬 저장
     file_path = os.path.join(SESSIONS_DIR, f"{session_id}.json")
     with open(file_path, "w", encoding="utf-8") as f:
         json.dump(messages, f, ensure_ascii=False, indent=2)
+
+    # 2. GitHub 실시간 자동 푸시
+    if GITHUB_TOKEN and GITHUB_REPO:
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/chat_sessions/{session_id}.json"
+        headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
+        try:
+            get_res = requests.get(url, headers=headers, timeout=5)
+            sha = get_res.json().get("sha") if get_res.status_code == 200 else None
+
+            content_str = json.dumps(messages, ensure_ascii=False, indent=2)
+            content_b64 = base64.b64encode(content_str.encode("utf-8")).decode("utf-8")
+            
+            payload = {
+                "message": f"Auto-sync chat session {session_id}",
+                "content": content_b64
+            }
+            if sha:
+                payload["sha"] = sha
+
+            requests.put(url, headers=headers, json=payload, timeout=5)
+        except Exception:
+            pass
+
+def delete_session_file(session_id):
+    """로컬 및 GitHub에서 세션 파일을 삭제합니다."""
+    file_path = os.path.join(SESSIONS_DIR, f"{session_id}.json")
+    if os.path.exists(file_path):
+        os.remove(file_path)
+
+    if GITHUB_TOKEN and GITHUB_REPO:
+        url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/chat_sessions/{session_id}.json"
+        headers = {"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
+        try:
+            get_res = requests.get(url, headers=headers, timeout=5)
+            if get_res.status_code == 200:
+                sha = get_res.json().get("sha")
+                payload = {"message": f"Delete chat session {session_id}", "sha": sha}
+                requests.delete(url, headers=headers, json=payload, timeout=5)
+        except Exception:
+            pass
 
 def get_session_title(messages):
     if not isinstance(messages, list):
@@ -71,13 +149,12 @@ def get_session_title(messages):
                 return clean_title[:20] + "..." if len(clean_title) > 20 else clean_title
     return "새로운 대화"
 
-# 이미지 크기 조절 (최대 길이 1024px 제한)
+# 이미지 크기 조절
 def resize_image(pil_img, max_size=1024):
     img = pil_img.copy()
     img.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
     return img
 
-# 이미지 PIL 객체를 Base64 문자열로 변환
 def image_to_base64(pil_img):
     buffered = BytesIO()
     if pil_img.mode in ("RGBA", "P"):
@@ -85,32 +162,26 @@ def image_to_base64(pil_img):
     pil_img.save(buffered, format="JPEG", quality=85)
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-# Base64 문자열을 PIL 객체로 변환
 def base64_to_image(b64_str):
     image_data = base64.b64decode(b64_str)
     return Image.open(BytesIO(image_data))
 
-# 3. Tavily 실시간 검색 함수
+# Tavily 검색
 def search_tavily(query):
     try:
         tavily = TavilyClient(api_key=TAVILY_API_KEY)
         response = tavily.search(query=query, search_depth="basic", max_results=5)
         results = response.get("results", [])
-        
         if not results:
             return "검색 결과가 없습니다."
-        
         context = "Tavily 실시간 웹 검색 결과:\n\n"
         for idx, item in enumerate(results, 1):
-            title = item.get("title", "")
-            snippet = item.get("content", "")
-            url = item.get("url", "")
-            context += f"[{idx}] {title}\n내용: {snippet}\n출처: {url}\n\n"
+            context += f"[{idx}] {item.get('title', '')}\n내용: {item.get('content', '')}\n출처: {item.get('url', '')}\n\n"
         return context
     except Exception as e:
         return f"[Tavily 검색 오류: {e}]"
 
-# 4. 웹페이지 링크 크롤링 함수 (보안 차단 시 빈값 반환)
+# 웹페이지 링크 크롤링
 def fetch_webpage_content(url):
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
@@ -120,13 +191,13 @@ def fetch_webpage_content(url):
             for script in soup(["script", "style", "nav", "footer", "header", "aside"]):
                 script.decompose()
             text = soup.get_text(separator=' ', strip=True)
-            if len(text) > 100:  # 내용이 정상적으로 긁혀온 경우에만 반환
+            if len(text) > 100:
                 return text[:6000]
     except Exception:
         pass
     return ""
 
-# 5. 세션 상태 초기화
+# 세션 상태 초기화
 if "current_session_id" not in st.session_state:
     all_sessions = get_all_sessions()
     if all_sessions:
@@ -140,7 +211,7 @@ if "messages" not in st.session_state:
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
 
-# 6. 사이드바 UI (대화 세션 목록 관리)
+# 사이드바 UI
 with st.sidebar:
     if st.button("➕ 새 대화 시작", use_container_width=True, type="primary"):
         new_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -169,9 +240,7 @@ with st.sidebar:
     st.divider()
     
     if st.button("🗑️ 현재 대화 삭제", use_container_width=True):
-        file_path = os.path.join(SESSIONS_DIR, f"{st.session_state.current_session_id}.json")
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        delete_session_file(st.session_state.current_session_id)
         
         remaining = get_all_sessions()
         if remaining:
@@ -184,7 +253,7 @@ with st.sidebar:
         st.session_state.uploader_key += 1
         st.rerun()
 
-# 7. 메인 화면 메시지 출력
+# 메인 화면 메시지 출력
 st.title(APP_TITLE)
 
 for msg in st.session_state.messages:
@@ -198,7 +267,6 @@ for msg in st.session_state.messages:
                     pass
             st.markdown(msg["content"])
 
-# 8. 답변 생성 필요 여부 확인
 is_generating = (
     bool(st.session_state.messages) and 
     st.session_state.messages[-1]["role"] == "user"
@@ -235,7 +303,7 @@ if not is_generating:
             current_img = resize_image(current_img)
             st.image(current_img, caption="전송할 이미지 (자동 리사이즈 적용됨)", width=250)
 
-# 9. 사용자 입력 처리
+# 사용자 입력 처리
 if user_input := st.chat_input("질문이나 지시사항, 혹은 분석할 링크를 입력하세요..."):
     if not GEMINI_API_KEYS:
         st.error("GEMINI_API_KEYS 설정이 필요합니다. .streamlit/secrets.toml 파일을 확인해 주세요.")
@@ -252,7 +320,7 @@ if user_input := st.chat_input("질문이나 지시사항, 혹은 분석할 링�
     st.session_state.uploader_key += 1
     st.rerun()
 
-# 10. 답변 생성 로직 (정밀 링크 Fallback + 전역 기억 200개 + 자동 재시도)
+# 답변 생성 로직
 if is_generating:
     last_user_msg = st.session_state.messages[-1]
     last_user_input = last_user_msg["content"]
@@ -262,7 +330,6 @@ if is_generating:
         kst = pytz.timezone('Asia/Seoul')
         now_str = datetime.now(kst).strftime("%Y년 %m월 %d일 %H시 %M분 (%A)")
 
-        # 1. 링크(URL) 감지 및 정밀 크롤링/검색 Fallback 처리
         url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
         found_urls = re.findall(url_pattern, last_user_input)
 
@@ -273,21 +340,15 @@ if is_generating:
             target_url = found_urls[0]
             with st.spinner(f"🔗 링크된 웹페이지 분석 중... ({target_url})"):
                 webpage_data = fetch_webpage_content(target_url)
-                
-                # 직접 읽기 실패(보안 차단 등) 시 Tavily 검색으로 정밀 우회 검색
                 if not webpage_data:
                     try:
                         domain = target_url.split('/')[2]
                         path_part = target_url.split('/')[-1]
-                        # 도메인과 고유 ID/경로를 조합해 검색 정확도 극대화
                         refined_query = f"site:{domain} {path_part}"
                         search_data = search_tavily(refined_query)
-                        if not search_data or "검색 결과가 없습니다" in search_data:
-                            search_data = search_tavily(target_url)
                     except Exception:
                         search_data = search_tavily(target_url)
 
-        # 2. 일반 검색 키워드 감지
         search_keywords = [
             "검색", "최신", "찾아", "뉴스", "정보", "알려", "구글",
             "몇", "개", "얼마", "언제", "누구", "어디", "현재", "오늘", "어제",
@@ -304,13 +365,12 @@ if is_generating:
                     search_query = f"{now_str} 기준 {last_user_input}"
                     search_data = search_tavily(search_query)
 
-        # 3. 전역 통합 이전 대화 기억 (최대 200개)
+        # 전역 통합 기억 (최대 200개)
         global_history_text = "--- [모든 채팅방 통합 이전 대화 기억] ---\n"
         all_session_files = get_all_sessions()
-        sorted_files = sorted(all_session_files, key=lambda x: os.path.getmtime(os.path.join(SESSIONS_DIR, x)))
         
         all_collected_msgs = []
-        for s_file in sorted_files:
+        for s_file in all_session_files:
             s_id = s_file.replace(".json", "")
             msgs = load_session(s_id)
             for msg in msgs:
@@ -342,7 +402,6 @@ if is_generating:
             img_to_send = base64_to_image(last_user_image_b64)
             contents_payload.append(img_to_send)
 
-        # [핵심] AI가 변명하지 못하도록 엄격한 지침 부여
         system_instruction_text = (
             f"너는 친절하고 정확한 AI 어시스턴트이다.\n"
             f"현재 시각은 대한민국 표준시(KST)로 [{now_str}] 이다.\n"
@@ -353,7 +412,7 @@ if is_generating:
         )
 
         answer_text = None
-        max_retries_per_key = 5  # 503/500/429 대응 재시도
+        max_retries_per_key = 5
         
         with st.spinner("답변을 생성하는 중 (서버 응답 대기 중)..."):
             for idx, key in enumerate(GEMINI_API_KEYS):
@@ -378,8 +437,7 @@ if is_generating:
                         error_msg = str(e)
                         if any(err in error_msg for err in ["503", "UNAVAILABLE", "500", "INTERNAL", "429", "RESOURCE_EXHAUSTED"]):
                             if attempt < max_retries_per_key - 1:
-                                sleep_time = 2 + (attempt * 1.5)
-                                time.sleep(sleep_time)
+                                time.sleep(2 + (attempt * 1.5))
                                 continue
                             else:
                                 break
